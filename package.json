@@ -4,7 +4,7 @@
   "description": "Autocomplétion intelligente pour balises HTML/JSX et props React dans .js/.jsx/.ts/.tsx",
   "version": "0.1.1",
   "publisher": "Thinolord",
-  "icon": "images/icon.png",
+  "icon": "image/icon.png",
   "author": {"email": "thinolord@gmail.com", "name": "Thinolord", "url": "https://github.com/ThinolordGit"},
   "engines": {
     "vscode": "^1.60.0"
