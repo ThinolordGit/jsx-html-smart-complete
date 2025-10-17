@@ -11,8 +11,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/tonpseudo/jsx-html-smart-complete.git"
-    },
+    "url": "https://github.com/ThinolordGit/jsx-html-smart-complete.git"
+  },
   "categories": ["Other", "Snippets", "Programming Languages"],
   "activationEvents": [
     "onLanguage:javascript",
