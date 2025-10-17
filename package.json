@@ -2,7 +2,7 @@
   "name": "jsx-html-smart-complete",
   "displayName": "JSX/HTML Smart Complete",
   "description": "Autocomplétion intelligente pour balises HTML/JSX et props React dans .js/.jsx/.ts/.tsx",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "Thinolord",
   "icon": "image/icon.png",
   "author": {"email": "thinolord@gmail.com", "name": "Thinolord", "url": "https://github.com/ThinolordGit"},

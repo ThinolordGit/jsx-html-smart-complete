@@ -12,25 +12,198 @@ function escapeSnippet(s: string) {
   return s.replace(/\$/g, "\\$");
 }
 
-/**
- * Trouve le "mot" contigu (séquence sans espace ni < ni >) juste avant le curseur.
- * Retourne { token, startPos }. Si aucun token, token = "" et startPos = position.
- */
-function getContiguousTokenBefore(document: vscode.TextDocument, position: vscode.Position): { token: string, startPos: vscode.Position } {
-  const line = document.lineAt(position.line).text;
-  let idx = position.character - 1;
-  if (idx < 0) return { token: "", startPos: position };
+function sanitizeFinalTokenWithRecovery(token: string): string | null {
+  let result = "";
+  let bracketBalance = 0;
+  let i = 0;
+  let foundRecoverable = false;
 
-  // marche arrière jusqu'à rencontrer un espace ou '<' ou '>' ou début de ligne
-  while (idx >= 0) {
-    const ch = line[idx];
-    if (ch === ' ' || ch === '\t' || ch === '<' || ch === '>' || ch === '\n' || ch === '\r') break;
-    idx--;
+  while (i < token.length) {
+    const ch = token[i];
+
+    if (ch === "[") {
+      bracketBalance++;
+      result += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === "]") {
+      if (bracketBalance === 0) {
+        // Crochets mal équilibrés → fin du token
+        break;
+      }
+      bracketBalance--;
+      result += ch;
+      i++;
+      continue;
+    }
+
+    // Pendant qu'on est dans un attribut, on accepte tout
+    if (bracketBalance > 0) {
+      result += ch;
+      i++;
+      continue;
+    }
+
+    // En dehors des crochets, on regarde les sélecteurs
+    if (/[.#A-Za-z0-9_-]/.test(ch)) {
+      result += ch;
+      if (ch === '.' || ch === '#') {
+        foundRecoverable = true;
+      }
+      i++;
+      continue;
+    }
+
+    // Caractère invalide en dehors des sélecteurs
+    break;
   }
-  const start = idx + 1;
-  const token = line.substring(start, position.character);
-  return { token, startPos: new vscode.Position(position.line, start) };
+
+  // Si le dernier bloc de crochets n’est pas fermé
+  if (bracketBalance > 0 && !foundRecoverable) {
+    return null; // On ne peut pas récupérer un sélecteur valide
+  }
+
+  return result;
 }
+
+function computeValidPostLength(rawToken: string, postToken: string, finalToken: string): number {
+  const from = rawToken.length;
+  const wantedPost = finalToken.slice(from);
+  let validLength = 0;
+
+  // On veut savoir combien de caractères initiaux de postToken sont restés dans wantedPost
+  for (let i = 0; i < postToken.length && i < wantedPost.length; i++) {
+    if (postToken[i] !== wantedPost[i]) break;
+    validLength++;
+  }
+
+  return validLength;
+}
+
+function getValidTokenRangeAtCursor(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): { token: string, range: vscode.Range } | null {
+  const line = document.lineAt(position.line).text;
+  
+  let start = position.character;
+  let end = position.character;
+  
+  // Reculer pour trouver le début
+  while (start > 0 && /[.#\[\]A-Za-z0-9="_-]/.test(line[start - 1])) {
+    start--;
+  }
+
+  // Avancer pour trouver la fin
+  while (end < line.length && /[.#\[\]A-Za-z0-9="_-]/.test(line[end])) {
+    end++;
+  }
+  
+  const rawToken = line.slice(start, position.character);
+  const postToken = line.slice(position.character, end);
+  const combined = rawToken + postToken;
+
+  const sanitized = sanitizeFinalTokenWithRecovery(combined);
+  if (!sanitized) return null;
+
+  // On recalcule la vraie longueur utile à remplacer (comme tu l’as dit plus tôt)
+  const postLength = computeValidPostLength(rawToken, postToken, sanitized);
+
+  const fullReplaceRange = new vscode.Range(
+    new vscode.Position(position.line, start),
+    new vscode.Position(position.line, position.character + postLength)
+  );
+
+  return {
+    token: sanitized,
+    range: fullReplaceRange
+  };
+}
+
+
+
+/**
+ * Trouve le "mot" contigu autour du curseur, en le découpant selon les séparateurs usuels (espace, <, >, etc.).
+ * 
+ * - `token` : la partie immédiatement **avant** le curseur (sans séparateur)
+ * - `postToken` : la partie immédiatement **après** le curseur (jusqu'au prochain séparateur)
+ * - `startPos` : position dans le document où commence `token` (utile pour la Range de remplacement)
+ * 
+ * Par exemple, si la ligne est :
+ * 
+ * ```tsx
+ * <MyComp.cla^ssName='foo'>
+ * ```
+ * (le curseur est entre le `a` et le `s`)
+ * 
+ * Alors cette fonction retournera :
+ * - token: `"MyComp.cla"`
+ * - postToken: `"ssName='foo'""`
+ * - startPos: position du `M`
+ * 
+ * @param document Le document VSCode dans lequel on travaille
+ * @param position La position actuelle du curseur
+ * @returns Un objet contenant `token`, `startPos` et `postToken`
+ */
+function getContiguousTokenBefore(document: vscode.TextDocument, position: vscode.Position): { token: string, startPos: vscode.Position, postToken: string } {
+  const line = document.lineAt(position.line).text;
+  let backIdx = position.character - 1;
+  let forwardIdx = position.character;
+  
+  if (backIdx < 0) return { token: "", startPos: position, postToken: "" };
+
+  // Reculer pour trouver le début du token
+  while (backIdx >= 0) {
+    const ch = line[backIdx];
+    if (ch === ' ' || ch === '\t' || ch === '<' || ch === '>' || ch === '\n' || ch === '\r') break;
+    backIdx--;
+  }
+  let start = backIdx + 1;
+  
+  // Avancer pour trouver la fin du token
+  while (forwardIdx < line.length) {
+    const ch = line[forwardIdx];
+    if (ch === ' ' || ch === '\t' || ch === '<' || ch === '>' || ch === '\n' || ch === '\r') break;
+    forwardIdx++;
+  }
+  
+   // Sélection brute
+  let tokenStart = line.substring(start, position.character);
+  let tokenEnd = line.substring(position.character, forwardIdx);
+
+//   let firstChar = effemtoken[effemtoken.length-1];
+//   let lastChar = effempostToken[effempostToken.length-1];
+  
+  // Nettoyage des caractères non pertinents en fin/début
+  while (
+    tokenStart.length > 0 &&
+    !/[.#\[A-Za-z0-9_-]/.test(tokenStart[0])
+  ) {
+    start++;
+    tokenStart = line.substring(start, position.character);
+  }
+
+  while (
+    tokenEnd.length > 0 &&
+    !/[.#\]A-Za-z0-9_-]/.test(tokenEnd[tokenEnd.length - 1])
+  ) {
+    forwardIdx--;
+    tokenEnd = line.substring(position.character, forwardIdx);
+  }
+  
+  
+  const token = line.substring(start, position.character); // avant curseur
+  const postToken = line.substring(position.character, forwardIdx) || ""; // après curseur
+
+  return {
+    token,
+    startPos: new vscode.Position(position.line, start),
+    postToken
+  };
+}
+
 
 /**
  * Parse un token comme :
@@ -49,24 +222,49 @@ function parseToken(token: string) {
   
   if (!token) return result;
   
-  // detect trailing char (. # [) with nothing after
-  const lastChar = token[token.length - 1];
-  if (lastChar === '.' || lastChar === '#' || lastChar === '[') {
-    result.endsWith = lastChar;
-  }
-
   // We'll iterate from left to right
   let i = 0;
   // optional tag at beginning
-  const tagMatch = token.slice(i).match(/^([A-Za-z][A-Za-z0-9-]*)/);
+  const tagMatch = token.slice(i).match(/^([A-Za-z][A-Za-z0-9_-]*)/);
   if (tagMatch) {
     result.tag = tagMatch[1];
     i += tagMatch[1].length;
   }
-  else {
-    result.tag = "div";
+  
+  if (token.length >= 1) {
+    const lastChar = token[token.length - 1];
+
+    
+    // if ( token.length >= i ) {
+    //     if ( !/[.#\[A-Za-z0-9_-]/.test(token[i]) ){
+    //         return {
+    //             tag: undefined as string | undefined,
+    //             classes: [] as string[],
+    //             id: undefined as string | undefined,
+    //             attrs: [] as string[],
+    //             endsWith: null as ('.' | '#' | '[' | null)
+    //         };
+    //     }
+    // }
+    
+    // if ( !/[.#\]A-Za-z0-9_-]/.test(lastChar)){
+    //     return {
+    //         tag: undefined as string | undefined,
+    //         classes: [] as string[],
+    //         id: undefined as string | undefined,
+    //         attrs: [] as string[],
+    //         endsWith: null as ('.' | '#' | '[' | null)
+    //     };
+    // }
+    
+    // detect trailing char (. # [) with nothing after
+    if (lastChar === '.' || lastChar === '#' || lastChar === '[') {
+      result.endsWith = lastChar;
+    }
   }
 
+  
+  
   // loop remaining
   while (i < token.length) {
     const ch = token[i];
@@ -115,7 +313,7 @@ function parseToken(token: string) {
       i++;
     }
   }
-  console.log(token,result)
+//   console.log(result);
   return result;
 }
 
@@ -125,56 +323,26 @@ function parseToken(token: string) {
  * classesArray: array of class strings
  * id: optional
  */
-function makeCompletionForParsed(parsed: ReturnType<typeof parseToken>, replaceRange: vscode.Range | null) {
-  const tag = (parsed.tag || "div");
-  const isSelfClosing = SELF_CLOSING.has(tag.toLowerCase());
+// function makeCompletionDefault({label="snippets",insertText,documentation,detail,sortText='000'}, replaceRange: vscode.Range | null) {
+//   let insert: vscode.SnippetString = insertText;
+//   const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
+//   item.insertText = insert;
+//   if (replaceRange) item.range = replaceRange;
+//   item.detail = detail;
+//   item.documentation = new vscode.MarkdownString(documentation);
+//   item.sortText = sortText;
+//   return item;
+// }
 
-  // construire string d'attributs : className / id / attrs[]
-  const parts: string[] = [];
-  if (parsed.classes.length) {
-    parts.push(`className="${escapeSnippet(parsed.classes.join(" "))}"`);
-  }
-  if (parsed.id) {
-    parts.push(`id="${escapeSnippet(parsed.id)}"`);
-  }
-  // insérer les attrs tels qu'ils sont fournis
-  for (const a of parsed.attrs) {
-    if (a && a.trim().length) {
-      parts.push(a);
-    }
-  }
-
-  // si l'utilisateur vient juste de taper '.' ou '#' on veut proposer un placeholder
-  if (parsed.endsWith === '.') {
-    parts.push(`className="\${1}"`);
-  } else if (parsed.endsWith === '#') {
-    parts.push(`id="\${1}"`);
-  } else if (parsed.endsWith === '[' && parsed.attrs.length && parsed.attrs[parsed.attrs.length - 1] === "") {
-    // user typed '[' with nothing inside: add placeholder inside bracket
-    // but we'll prefer proposing the attribute placed outside of brackets (JSX syntax expects attr not [attr])
-    // for compatibility with your design, if endsWith '[' propose a placeholder attr token inserted as-is
-    parts.push(`\${1:data-attr}`);
-  }
-
-  // assemble attrs snippet
-  const attrsSnippet = parts.join(" ").trim();
-
-  // build snippet string
-  let insert: vscode.SnippetString;
-  if (isSelfClosing) {
-    if (attrsSnippet) insert = new vscode.SnippetString(`<${tag} ${attrsSnippet} />`);
-    else insert = new vscode.SnippetString(`<${tag} />`);
-  } else {
-    if (attrsSnippet) insert = new vscode.SnippetString(`<${tag} ${attrsSnippet}>$0</${tag}>`);
-    else insert = new vscode.SnippetString(`<${tag} \${1}>$0</${tag}>`);
-  }
-
-  const label = isSelfClosing ? `<${tag} />` : `<${tag}></${tag}>`;
+function makeCompletion({label="snippets",snippet,tag=null,fakesnippet,sortText='000'}, replaceRange: vscode.Range | null,isJsx: boolean = true) {
+  
   const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
-  item.insertText = insert;
-  if (replaceRange) item.range = replaceRange;
-  item.detail = `JSX <${tag}> (generated from token)`;
-  item.sortText = "000";
+              
+  item.insertText = new vscode.SnippetString(snippet);
+  item.detail = tag ? `JSX <${tag}> autocompletion` : `JSX autocompletion`;
+  item.documentation = `${isJsx ? "JSX " : "Helper "} ${fakesnippet}.`;
+  item.range = replaceRange;
+  item.sortText = sortText;   
   return item;
 }
 
@@ -192,111 +360,259 @@ export function activate(context: vscode.ExtensionContext) {
   const provider = vscode.languages.registerCompletionItemProvider(
     selector,
     {
-      provideCompletionItems(document: vscode.TextDocument, position: vscode.Position, token: vscode.CancellationToken, ctx: vscode.CompletionContext) {
-        // 1) récupérer le token contigu juste avant le curseur (sans espaces)
-        const { token: rawToken, startPos } = getContiguousTokenBefore(document, position);
-        
-        // 2) si pas de token du tout, on peut early-return (ou proposer basiques)
-        if (!rawToken) {
-          // Optionnel: proposer une liste rapide de tags si l'utilisateur commence à taper lettres (déjà géré ailleurs)
-          return undefined;
-        }
-        
-        // 3) parser ce token entier
-        const parsed = parseToken(rawToken);
-        
-        // 4) construire la Range de remplacement : du startPos jusqu'à position (on remplace le token entier)
-        const replaceRange = new vscode.Range(startPos, position);
-        
-        const tag0 = parsed.tag || "div";
-        const isSelf = SELF_CLOSING.has(tag0.toLowerCase());
-        
-        // 5) créer complétion principale (balise complète)
-        const completions: vscode.CompletionItem[] = [];
-        // completions.push(makeCompletionForParsed(parsed, replaceRange));
+        provideCompletionItems(
+            document: vscode.TextDocument,
+            position: vscode.Position,
+            token: vscode.CancellationToken,
+            ctx: vscode.CompletionContext
+            ) {
+            const { token: rawToken, startPos, postToken } = getContiguousTokenBefore(document, position);
+            let postLength = 0;
+            let reconstructPostToken = "";
+            let bracketBalance = 0;
 
-        // 6) Cas spécifiques : si token se termine par '.' => proposer className standalone
-        if (parsed && parsed.tag) {
-          const { tag, classes, id, attrs, endsWith } = parsed;
+            while (postToken && postLength < postToken.length) {
+              const ch = postToken[postLength];
 
-          let snippet = `<${tag}`;
-          if (classes?.length) snippet += ` className="${classes.join(' ')}"`;
-          if (rawToken.includes(".")) snippet +=  ` className=""`;
-          if (id) snippet += ` id="${id}"`;
-          if (rawToken.includes("#")) snippet +=  ` id=""`;
-          if (attrs?.length)
-            snippet += ' ' + attrs.join(' ');
-          
-          // Auto-closing tag si applicable
-          const selfClosing = isSelf;
-          if (selfClosing) {
-            if (tag.toLocaleLowerCase() === "img") snippet += ` src=""`
-            snippet += ' />';
-          } else {
-            snippet += `></${tag}>`;
-          }
-          console.log(snippet)
-          const item = new vscode.CompletionItem(`<${tag}>`, vscode.CompletionItemKind.Snippet);
-          item.insertText = new vscode.SnippetString(snippet);
-          item.detail = `JSX autocompletion for <${tag}>`;
-          item.documentation = `Génère automatiquement la balise <${tag}> complète avec ses attributs JSX.`;
-          item.range = replaceRange;
-          
-          completions.push(item);
-        }
-       
-        
-       // 7) Sinon, comportement contextuel : on veut que les suggestions apparaissent aussi
-        //    quand le curseur est juste après un ".", "#", ou "]".
-        else {
-            const firstChar = rawToken[0];
-            console.log(firstChar)
-            if ([".", "#","["].includes(firstChar)) {
-                const { tag, classes, id, attrs, endsWith } = parsed;
-                let snippet = `<div`;
-                if (classes?.length)  snippet += ` className="${classes.join(' ')}"`;
-                if (rawToken.includes(".")) snippet +=  ` className=""`;
-                if (id) snippet += ` id="${id}"`;
-                if (rawToken.includes("#")) snippet +=  ` id=""`;
-                if (attrs?.length) snippet += ' ' + attrs.join(' ');
-                
-                // Auto-closing tag si applicable
-                const selfClosing = isSelf;
-                if (selfClosing) {
-                    snippet += ' />';
+              // autorisé : lettres, chiffres, ., #, -, _
+              if (/[A-Za-z0-9_.#-]/.test(ch)) {
+                reconstructPostToken += ch;
+                postLength++;
+                continue;
+              }
+
+              // si crochet ouvrant
+              if (ch === "[") {
+                bracketBalance++;
+                reconstructPostToken += ch;
+                postLength++;
+                continue;
+              }
+
+              // si crochet fermant
+              if (ch === "]") {
+                if (bracketBalance === 0) {
+                  // on rencontre un ] sans avoir ouvert -> stop ici
+                  break;
                 } else {
-                    snippet += `></div>`;
+                  bracketBalance--;
+                  reconstructPostToken += ch;
+                  postLength++;
+                  continue;
                 }
+              }
 
-                const item = new vscode.CompletionItem(`<div>`, vscode.CompletionItemKind.Snippet);
-                item.insertText = new vscode.SnippetString(snippet);
-                item.detail = `JSX autocompletion for <div>`;
-                item.documentation = `Génère automatiquement la balise <div> complète avec ses attributs JSX.`;
-                item.range = replaceRange;
-                
-                completions.push(item);
+              // sinon : caractère non autorisé = stop
+              break;
             }
+            
+            const finalToken = rawToken+reconstructPostToken;
+            
+            // const replaceRange = new vscode.Range(startPos, position);
+            const replaceRange = new vscode.Range(startPos, new vscode.Position(position.line, position.character + postLength));
+            
+            // if (!rawToken) {
+            //     return undefined;
+            // }
+            if (!finalToken && ctx.triggerKind !== vscode.CompletionTriggerKind.TriggerForIncompleteCompletions) {
+                return undefined;
+            }
+            
+            const completions: vscode.CompletionItem[] = [];
+            
+            
+            
+            // const escapedToken = escapeSnippet(finalToken);
+            
+            // ✨ Snippet spécial pour jsxbuildX__tag
+            const jsxBuildMatch = finalToken.match(/^jsxbuild([A-Z][A-Za-z0-9__]*)(?:__(\w+))?$/);
+            // console.log(jsxBuildMatch);
+            if (jsxBuildMatch) {
+                const componentName = jsxBuildMatch[1]; // e.g., MyCard
+                const htmlTag = jsxBuildMatch[2] || "div"; // e.g., section, article…
+                // const htmlElementType = `HTML${htmlTag[0].toUpperCase()}${htmlTag.slice(1)}Element`;
+                
+                const snippet = new vscode.SnippetString(
+`
+/**
+ * ${componentName} component
+ * 
+ * @param props - React.HTMLAttributes<HTMLElement>
+ */
+function \${1:${componentName}} ({children,className = '',style = {},...rest}) {
+ return (
+  <${htmlTag} className={className} style={style} {...rest}>
+   {children}
+  </${htmlTag}>
+ );
+}`
+                );
+                
+                // const label = `JSX: function ${componentName} (..) { return <${htmlTag} className={className} style={style} {...rest}> ... </${htmlTag}> }`;
+                const label = jsxBuildMatch[0];
+                const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
+                item.insertText = snippet;
+                item.detail = `React component <${htmlTag}> with props`;
+                // item.documentation = `Génère un composant React nommé **${componentName}** utilisant une balise **<${htmlTag}>** avec les props.`;
+                item.documentation = `JSX: function ${componentName} (..) { return <${htmlTag} className={className} style={style} {...rest}> | </${htmlTag}> }`;
+                item.range = replaceRange;
+                item.sortText = "000";
+                completions.push(item);
+                // let finalList = new vscode.CompletionList(completions, false);
+                // return finalList;
+            }
+
+            if (/^js/.test(finalToken)) {
+             const hintItem = new vscode.CompletionItem(
+                 "💡jsxbuildXcomponent__tagName pour créer un composant React",
+                 vscode.CompletionItemKind.Snippet
+             );
+             hintItem.insertText = `
+/**
+ * Xcomponent component
+ * 
+ * @param props - React.HTMLAttributes<HTMLElement>
+ */
+function \${1:Xcomponent} ({children,className = '',style = {},...rest}) {
+ return (
+  <tagName className={className} style={style} {...rest}>
+   {children}
+  </tagName>
+ );
+}`; // Ne remplace rien
+             hintItem.detail = "Ex: jsxbuildCard__section → function Card() { return <section> }";
+             hintItem.documentation = new vscode.MarkdownString(
+                 `👉 Pour générer un **composant React** avec props auto-gérés, tape \`jsxbuildNom__balise\`.\n\n**Exemples** :\n- \`jsxbuildCard__section\`\n- \`jsxbuildHeader__header\``
+             );
+             hintItem.range = replaceRange;
+             hintItem.sortText = "001"; // Position basse
+             completions.push(hintItem);
+            }
+            
+            
+            const parsed = parseToken(finalToken);
+            
+            // Utiliser "div" par défaut si pas de tag
+            const tag = parsed.tag || "div";
+            const selfClosing = SELF_CLOSING.has(tag.toLowerCase());
+            
+            let snippet: string;
+            let fakesnippet: string;
+            let toFoc = 1;
+            let mapSnippet: {snip: string;fsnip: string;isJsx: boolean;}[]= [];
+            if ( escapeSnippet(finalToken).startsWith ("fun") ) {
+              snippet = `(\${1:param}) => { \${0} }`;
+              fakesnippet = `(\`param\`) =>{ | }`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
+            }
+            if ( escapeSnippet(finalToken).startsWith ("fun") ) {
+              snippet = `() => { \${0} }`;
+              fakesnippet = `() =>{ | }`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
+            }
+            
+            if ( escapeSnippet(finalToken) === "func" ) {
+              snippet = `(param) => { \${0} }`;
+              fakesnippet = `(param) =>{ | }`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
+            }
+            
+            if ( escapeSnippet(finalToken) === "greaterThan" || escapeSnippet(finalToken) === "sup") {
+              snippet = `>\${0}`;
+              fakesnippet = `>|`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
+            }
+            
+            if ( escapeSnippet(finalToken) === "minusThan" || escapeSnippet(finalToken) === "inf") {
+              snippet = `<\${0}`;
+              fakesnippet = `<|`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
+            }
+            
+            if ( escapeSnippet(finalToken) === "void" ) {
+              snippet = `<>\${0}</>`;
+              fakesnippet = `<>|</>`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
+            }
+
+            // else {
+              snippet = `<${tag}`;
+              fakesnippet = `<${tag}`;
+              
+              // Ajout des classes
+              if (parsed.classes.length) {
+                snippet += ` className="${parsed.classes.join(" ")}"`;
+                fakesnippet += ` className="${parsed.classes.join(" ")}"`;
+              }
+              if (finalToken.includes(".") && !parsed.classes.length) {
+                snippet += ` className="\${1}"`;
+                fakesnippet += ` className="|"`;
+                toFoc++;
+              }
+              
+              // Ajout de l'ID
+              if (parsed.id) {
+                snippet += ` id="${escapeSnippet(parsed.id)}"`;
+                fakesnippet += ` id="${escapeSnippet(parsed.id)}"`;
+                toFoc++;
+              }
+              if (finalToken.includes("#") && !!!parsed.id) {
+                snippet += ` id="\${1}"`;
+                fakesnippet += ` id="|"`;
+              }
+              
+              // Ajout des attributs
+              if (parsed.attrs.length) {
+                snippet += " " + parsed.attrs.join(" ");
+                fakesnippet += " " + parsed.attrs.join(" ");
+              }
+              
+              // Fermeture de la balise
+              if (selfClosing) {
+                if (tag.toLocaleLowerCase() !== "img") {
+                  if (!parsed.attrs.includes("alt")) {
+                    snippet += ` alt="\${${toFoc}}"`;
+                    fakesnippet += ` alt="|"`;
+                    toFoc++;
+                  }
+                }
+                
+                snippet += " />";
+                fakesnippet += " />";
+                    
+              } 
+              else {
+                  snippet += `>\${0}</${tag}>`;
+                  fakesnippet += `>|</${tag}>`;
+              }
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:true});
+            // }
+            
+            console.log("Token", rawToken);
+            console.log("Post token", postToken);
+            
+            for (let snipp of mapSnippet) {
+              const item = makeCompletion(
+                { label: finalToken, snippet: snipp.snip, fakesnippet: snipp.fsnip },
+                replaceRange,
+                snipp.isJsx
+              );
+              completions.push(item);
+            }
+            
+            // console.log("Parsed token:", rawToken, parsed);
+            // console.log("Returning snippet:", snippet);
+            console.log("Completions:", completions);
+            const finalList = new vscode.CompletionList(completions, true);
+            // console.log("CompletionList:", finalList);
+            return finalList;
         }
         
-        
-        return new vscode.CompletionList(completions, false);
-      }
     },
-    ".", "#", "[", "]", "<" // triggers
+    ".", "]" // "#", "[", "]", "<" // triggers
   );
 
   context.subscriptions.push(provider);
 }
 
 export function deactivate() {}
-
-// je n'ai pas de suggestion alors voici mon log:
-// div {tag: 'div', classes: Array(0), id: undefined, attrs: Array(0), endsWith: null}
-// extensionHostProcess.js:207
-// <div></div>
-// extensionHostProcess.js:207
-// div. {tag: 'div', classes: Array(0), id: undefined, attrs: Array(0), endsWith: '.'}
-// extensionHostProcess.js:207
-// <div className=""></div>
-
-// pour "div" j'ai eu de suggestion mais pas pour "div." ni "div#" ...

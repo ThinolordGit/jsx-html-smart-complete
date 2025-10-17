@@ -12,6 +12,122 @@ function escapeSnippet(s: string) {
   return s.replace(/\$/g, "\\$");
 }
 
+function sanitizeFinalTokenWithRecovery(token: string): string | null {
+  let bracketBalance = 0;
+  let i = 0;
+  let recoverStartIndex = -1;
+  let foundRecoverable = true;
+
+  while (i < token.length) {
+    const ch = token[i];
+
+    if (ch === "[") {
+      bracketBalance++;
+      i++;
+      continue;
+    }
+
+    if (ch === "]") {
+      if (bracketBalance === 0) {
+        i++;
+        recoverStartIndex = i;
+        continue;
+      }
+      else {
+        i++;
+        bracketBalance--;
+        continue;
+      }
+    }
+    
+    if (bracketBalance > 0) {
+      i++;
+      continue;
+    }
+
+    if (/[.#\[A-Za-z0-9_-]/.test(ch)) {
+      if (recoverStartIndex === -1) {
+        recoverStartIndex = i;
+      }
+      if (ch === '.' || ch === '#' || ch === '[') {
+        foundRecoverable = true;
+      }
+      i++;
+      continue;
+    }
+
+    // Fin dès qu'on touche un char non valide
+    break;
+  }
+
+  if (recoverStartIndex !== -1) {
+    let res = token.slice(recoverStartIndex, i);
+    // console.log(res);
+    return res;
+  }
+
+  return null;
+}
+
+
+function computeValidPostLength(rawToken: string, postToken: string, finalToken: string): number {
+  const from = rawToken.length;
+  const wantedPost = finalToken.slice(from);
+  let validLength = 0;
+
+  // On veut savoir combien de caractères initiaux de postToken sont restés dans wantedPost
+  for (let i = 0; i < postToken.length && i < wantedPost.length; i++) {
+    if (postToken[i] !== wantedPost[i]) break;
+    validLength++;
+  }
+
+  return validLength;
+}
+
+function getValidTokenRangeAtCursor(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): { token: string, range: vscode.Range } | null {
+  const line = document.lineAt(position.line).text;
+  
+  let start = position.character;
+  let end = position.character;
+  
+  // Reculer pour trouver le début
+  while (start > 0 && /[.#\[\]\{\}\>\'A-Za-z0-9="_-]/.test(line[start - 1])) {
+    start--;
+  }
+
+  // Avancer pour trouver la fin
+  while (end < line.length && /[.#\[\]\{\}\>\'A-Za-z0-9="_-]/.test(line[end])) {
+    end++;
+  }
+  
+  const rawToken = line.slice(start, position.character);
+  const postToken = line.slice(position.character, end);
+  const combined = rawToken + postToken;
+  const sanitized = sanitizeFinalTokenWithRecovery(combined);
+
+  if (!sanitized) return null;
+
+  // console.log("sanitized :",sanitized);
+
+  // On recalcule la vraie longueur utile à remplacer (comme tu l’as dit plus tôt)
+  const postLength = computeValidPostLength(rawToken, postToken, sanitized);
+
+  const fullReplaceRange = new vscode.Range(
+    new vscode.Position(position.line, start),
+    new vscode.Position(position.line, position.character + postLength)
+  );
+
+  return {
+    token: sanitized,
+    range: fullReplaceRange
+  };
+}
+
+
+
 /**
  * Trouve le "mot" contigu autour du curseur, en le découpant selon les séparateurs usuels (espace, <, >, etc.).
  * 
@@ -83,7 +199,7 @@ function getContiguousTokenBefore(document: vscode.TextDocument, position: vscod
   
   
   const token = line.substring(start, position.character); // avant curseur
-  const postToken = line.substring(position.character, forwardIdx); // après curseur
+  const postToken = line.substring(position.character, forwardIdx) || ""; // après curseur
 
   return {
     token,
@@ -123,19 +239,8 @@ function parseToken(token: string) {
     const lastChar = token[token.length - 1];
 
     
-    if ( token.length >= i ) {
-        if ( !/[.#\[A-Za-z0-9_-]/.test(token[i]) ){
-            return {
-                tag: undefined as string | undefined,
-                classes: [] as string[],
-                id: undefined as string | undefined,
-                attrs: [] as string[],
-                endsWith: null as ('.' | '#' | '[' | null)
-            };
-        }
-    }
-    // if ( token.length >= i + 1) {
-    //     if ( !/[.#\[A-Za-z0-9_-]/.test(token[i+1]) ){
+    // if ( token.length >= i ) {
+    //     if ( !/[.#\[A-Za-z0-9_-]/.test(token[i]) ){
     //         return {
     //             tag: undefined as string | undefined,
     //             classes: [] as string[],
@@ -145,17 +250,17 @@ function parseToken(token: string) {
     //         };
     //     }
     // }
-
-    if ( !/[.#\]A-Za-z0-9_-]/.test(lastChar)){
-        return {
-            tag: undefined as string | undefined,
-            classes: [] as string[],
-            id: undefined as string | undefined,
-            attrs: [] as string[],
-            endsWith: null as ('.' | '#' | '[' | null)
-        };
-    }
-
+    
+    // if ( !/[.#\]A-Za-z0-9_-]/.test(lastChar)){
+    //     return {
+    //         tag: undefined as string | undefined,
+    //         classes: [] as string[],
+    //         id: undefined as string | undefined,
+    //         attrs: [] as string[],
+    //         endsWith: null as ('.' | '#' | '[' | null)
+    //     };
+    // }
+    
     // detect trailing char (. # [) with nothing after
     if (lastChar === '.' || lastChar === '#' || lastChar === '[') {
       result.endsWith = lastChar;
@@ -222,56 +327,26 @@ function parseToken(token: string) {
  * classesArray: array of class strings
  * id: optional
  */
-function makeCompletionForParsed(parsed: ReturnType<typeof parseToken>, replaceRange: vscode.Range | null) {
-  const tag = (parsed.tag || "div");
-  const isSelfClosing = SELF_CLOSING.has(tag.toLowerCase());
+// function makeCompletionDefault({label="snippets",insertText,documentation,detail,sortText='000'}, replaceRange: vscode.Range | null) {
+//   let insert: vscode.SnippetString = insertText;
+//   const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
+//   item.insertText = insert;
+//   if (replaceRange) item.range = replaceRange;
+//   item.detail = detail;
+//   item.documentation = new vscode.MarkdownString(documentation);
+//   item.sortText = sortText;
+//   return item;
+// }
+
+function makeCompletion({label="snippets",snippet,tag=null,fakesnippet,sortText='000'}, replaceRange: vscode.Range | null,isJsx: boolean = true) {
   
-  // construire string d'attributs : className / id / attrs[]
-  const parts: string[] = [];
-  if (parsed.classes.length) {
-    parts.push(`className="${escapeSnippet(parsed.classes.join(" "))}"`);
-  }
-  if (parsed.id) {
-    parts.push(`id="${escapeSnippet(parsed.id)}"`);
-  }
-  // insérer les attrs tels qu'ils sont fournis
-  for (const a of parsed.attrs) {
-    if (a && a.trim().length) {
-      parts.push(a);
-    }
-  }
-  
-  // si l'utilisateur vient juste de taper '.' ou '#' on veut proposer un placeholder
-  if (parsed.endsWith === '.') {
-    parts.push(`className="\${1}"`);
-  } else if (parsed.endsWith === '#') {
-    parts.push(`id="\${1}"`);
-  } else if (parsed.endsWith === '[' && parsed.attrs.length && parsed.attrs[parsed.attrs.length - 1] === "") {
-    // user typed '[' with nothing inside: add placeholder inside bracket
-    // but we'll prefer proposing the attribute placed outside of brackets (JSX syntax expects attr not [attr])
-    // for compatibility with your design, if endsWith '[' propose a placeholder attr token inserted as-is
-    parts.push(`\${1:data-attr}`);
-  }
-  
-  // assemble attrs snippet
-  const attrsSnippet = parts.join(" ").trim();
-  
-  // build snippet string
-  let insert: vscode.SnippetString;
-  if (isSelfClosing) {
-    if (attrsSnippet) insert = new vscode.SnippetString(`<${tag} ${attrsSnippet} />`);
-    else insert = new vscode.SnippetString(`<${tag} />`);
-  } else {
-    if (attrsSnippet) insert = new vscode.SnippetString(`<${tag} ${attrsSnippet}>$0</${tag}>`);
-    else insert = new vscode.SnippetString(`<${tag} \${1}>$0</${tag}>`);
-  }
-  
-  const label = isSelfClosing ? `<${tag} />` : `<${tag}></${tag}>`;
   const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
-  item.insertText = insert;
-  if (replaceRange) item.range = replaceRange;
-  item.detail = `JSX <${tag}> (generated from token)`;
-  item.sortText = "000";
+              
+  item.insertText = new vscode.SnippetString(snippet);
+  item.detail = tag ? `JSX <${tag}> autocompletion` : `JSX autocompletion`;
+  item.documentation = `${isJsx ? "JSX " : "Helper "} ${fakesnippet}.`;
+  item.range = replaceRange;
+  item.sortText = sortText;   
   return item;
 }
 
@@ -295,40 +370,22 @@ export function activate(context: vscode.ExtensionContext) {
             token: vscode.CancellationToken,
             ctx: vscode.CompletionContext
             ) {
-            const { token: rawToken, startPos, postToken } = getContiguousTokenBefore(document, position);
+              
+            const result = getValidTokenRangeAtCursor(document, position);
+            if (!result) return undefined;
+            // console.log(result);
+            const { token: finalToken, range: replaceRange } = result;
             
-            // if (!rawToken) {
-            //     return undefined;
-            // }
-            if (!rawToken && ctx.triggerKind !== vscode.CompletionTriggerKind.TriggerForIncompleteCompletions) {
+            if (!finalToken && ctx.triggerKind !== vscode.CompletionTriggerKind.TriggerForIncompleteCompletions) {
                 return undefined;
             }
             
             const completions: vscode.CompletionItem[] = [];
             
-            const finalToken = rawToken+postToken;
             
-            // const replaceRange = new vscode.Range(startPos, position);
-            const replaceRange = new vscode.Range(startPos, new vscode.Position(position.line, position.character + postToken.length));
             
             // const escapedToken = escapeSnippet(finalToken);
             
-            if (/^jsx/.test(finalToken)) {
-                const hintItem = new vscode.CompletionItem(
-                    "💡 jsxbuildXcomponent__tag pour créer un composant React",
-                    vscode.CompletionItemKind.Snippet
-                );
-                hintItem.insertText = "jsxbuildXcomponent__tag"; // Ne remplace rien
-                hintItem.detail = "Ex: jsxbuildCard__section → function Card() { return <section> }";
-                hintItem.documentation = new vscode.MarkdownString(
-                    `👉 Pour générer un **composant React** avec props auto-gérés, tape \`jsxbuildNom__balise\`.\n\n**Exemples** :\n- \`jsxbuildCard__section\`\n- \`jsxbuildHeader__header\``
-                );
-                hintItem.range = replaceRange;
-                hintItem.sortText = "001"; // Position basse
-
-                completions.push(hintItem);
-                }
-
             // ✨ Snippet spécial pour jsxbuildX__tag
             const jsxBuildMatch = finalToken.match(/^jsxbuild([A-Z][A-Za-z0-9]*)(?:__(\w+))?$/);
             // console.log(jsxBuildMatch);
@@ -344,7 +401,7 @@ export function activate(context: vscode.ExtensionContext) {
  * 
  * @param props - React.HTMLAttributes<HTMLElement>
  */
-function \${1:${componentName}}({children,className = '',style = {},...rest}) {
+function \${1:${componentName}} ({children,className = '',style = {},...rest}) {
  return (
   <${htmlTag} className={className} style={style} {...rest}>
    {children}
@@ -357,15 +414,43 @@ function \${1:${componentName}}({children,className = '',style = {},...rest}) {
                 const label = jsxBuildMatch[0];
                 const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
                 item.insertText = snippet;
-                item.detail = `React component <${htmlTag}> with full props`;
-                // item.documentation = `Génère un composant React nommé **${componentName}** utilisant une balise **<${htmlTag}>** avec tous les props.`;
-                item.documentation = `JSX: function ${componentName} (..) { return <${htmlTag} className={className} style={style} {...rest}> ... </${htmlTag}> }`;
+                item.detail = `React component <${htmlTag}> with props`;
+                // item.documentation = `Génère un composant React nommé **${componentName}** utilisant une balise **<${htmlTag}>** avec les props.`;
+                item.documentation = `JSX: function ${componentName} (..) { return <${htmlTag} className={className} style={style} {...rest}> | </${htmlTag}> }`;
                 item.range = replaceRange;
                 item.sortText = "000";
                 completions.push(item);
                 // let finalList = new vscode.CompletionList(completions, false);
                 // return finalList;
             }
+
+            if (/^js/.test(finalToken)) {
+             const hintItem = new vscode.CompletionItem(
+                 "💡jsxbuildXcomponent__tagName pour créer un composant React",
+                 vscode.CompletionItemKind.Snippet
+             );
+             hintItem.insertText = `
+/**
+ * Xcomponent component
+ * 
+ * @param props - React.HTMLAttributes<HTMLElement>
+ */
+function \${1:Xcomponent} ({children,className = '',style = {},...rest}) {
+ return (
+  <tagName className={className} style={style} {...rest}>
+   {children}
+  </tagName>
+ );
+}`; // Ne remplace rien
+             hintItem.detail = "Ex: jsxbuildCard__section → function Card() { return <section> }";
+             hintItem.documentation = new vscode.MarkdownString(
+                 `👉 Pour générer un **composant React** avec props auto-gérés, tape \`jsxbuildNom__balise\`.\n\n**Exemples** :\n- \`jsxbuildCard__section\`\n- \`jsxbuildHeader__header\``
+             );
+             hintItem.range = replaceRange;
+             hintItem.sortText = "001"; // Position basse
+             completions.push(hintItem);
+            }
+            
             
             const parsed = parseToken(finalToken);
             
@@ -376,91 +461,106 @@ function \${1:${componentName}}({children,className = '',style = {},...rest}) {
             let snippet: string;
             let fakesnippet: string;
             let toFoc = 1;
-            let isJsx = false;
+            let mapSnippet: {snip: string;fsnip: string;isJsx: boolean;}[]= [];
+            if ( escapeSnippet(finalToken).startsWith ("fun") ) {
+              snippet = `(\${1:param}) => { \${0} }`;
+              fakesnippet = `(\`param\`) =>{ | }`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
+            }
+            if ( escapeSnippet(finalToken).startsWith ("fun") ) {
+              snippet = `() => { \${0} }`;
+              fakesnippet = `() =>{ | }`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
+            }
             
             if ( escapeSnippet(finalToken) === "func" ) {
-                snippet = `(param) => { \${0} }`;
-                fakesnippet = `(param) =>{ | }`;
+              snippet = `(param) => { \${0} }`;
+              fakesnippet = `(param) =>{ | }`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
             }
-            else if ( escapeSnippet(finalToken) === "greaterThan" ) {
-                snippet = `>\${0}`;
-                fakesnippet = `>|`;
-            }
-            else if ( escapeSnippet(finalToken) === "minusThan" ) {
-                snippet = `<\${0}`;
-                fakesnippet = `<|`;
-            }
-            else if ( escapeSnippet(finalToken) === "void" ) {
-                snippet = `<>\${0}</>`;
-                fakesnippet = `<>|</>`;
-            }
-            else {
-                isJsx = true;
-                snippet = `<${tag}`;
-                fakesnippet = `<${tag}`;
             
-                // Ajout des classes
-                if (parsed.classes.length) {
-                    snippet += ` className="${parsed.classes.join(" ")}"`;
-                    fakesnippet += ` className="${parsed.classes.join(" ")}"`;
-                }
-                if (finalToken.includes(".") && !parsed.classes.length) {
-                    snippet += ` className="\${1}"`;
-                    fakesnippet += ` className="|"`;
-                    toFoc++;
-                }
-                
-                // Ajout de l'ID
-                if (parsed.id) {
-                    snippet += ` id="${escapeSnippet(parsed.id)}"`;
-                    fakesnippet += ` id="${escapeSnippet(parsed.id)}"`;
-                    toFoc++;
-                }
-                if (finalToken.includes("#") && !!!parsed.id) {
-                    snippet += ` id="\${1}"`;
-                    fakesnippet += ` id="|"`;
-                }
-                
-                // Ajout des attributs
-                if (parsed.attrs.length) {
-                    snippet += " " + parsed.attrs.join(" ");
-                    fakesnippet += " " + parsed.attrs.join(" ");
-                }
-                
-                // Fermeture de la balise
-                if (selfClosing) {
-                    if (tag.toLocaleLowerCase() !== "img") {
-                        if (!parsed.attrs.includes("alt")) {
-                            snippet += ` alt="\${${toFoc}}"`;
-                            fakesnippet += ` alt="|"`;
-                            toFoc++;
-                        }
-                    }
+            if ( escapeSnippet(finalToken) === "greaterThan" || escapeSnippet(finalToken) === "sup") {
+              snippet = `>\${0}`;
+              fakesnippet = `>|`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
+            }
+            
+            if ( escapeSnippet(finalToken) === "minusThan" || escapeSnippet(finalToken) === "inf") {
+              snippet = `<\${0}`;
+              fakesnippet = `<|`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
+            }
+            
+            if ( escapeSnippet(finalToken) === "void" ) {
+              snippet = `<>\${0}</>`;
+              fakesnippet = `<>|</>`;
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:false});
+            }
 
-                    snippet += " />";
-                    fakesnippet += " />";
+            // else {
+              snippet = `<${tag}`;
+              fakesnippet = `<${tag}`;
+              
+              // Ajout des classes
+              if (parsed.classes.length) {
+                snippet += ` className="${parsed.classes.join(" ")}"`;
+                fakesnippet += ` className="${parsed.classes.join(" ")}"`;
+              }
+              if (finalToken.includes(".") && !parsed.classes.length) {
+                snippet += ` className="\${1}"`;
+                fakesnippet += ` className="|"`;
+                toFoc++;
+              }
+              
+              // Ajout de l'ID
+              if (parsed.id) {
+                snippet += ` id="${escapeSnippet(parsed.id)}"`;
+                fakesnippet += ` id="${escapeSnippet(parsed.id)}"`;
+                toFoc++;
+              }
+              if (finalToken.includes("#") && !!!parsed.id) {
+                snippet += ` id="\${1}"`;
+                fakesnippet += ` id="|"`;
+              }
+              
+              // Ajout des attributs
+              if (parsed.attrs.length) {
+                snippet += " " + parsed.attrs.join(" ");
+                fakesnippet += " " + parsed.attrs.join(" ");
+              }
+              
+              // Fermeture de la balise
+              if (selfClosing) {
+                if (tag.toLocaleLowerCase() !== "img") {
+                  if (!parsed.attrs.includes("alt")) {
+                    snippet += ` alt="\${${toFoc}}"`;
+                    fakesnippet += ` alt="|"`;
+                    toFoc++;
+                  }
+                }
+                
+                snippet += " />";
+                fakesnippet += " />";
                     
-                } else {
-                    snippet += `>\${0}</${tag}>`;
-                    fakesnippet += `>|</${tag}>`;
-                }
+              } 
+              else {
+                  snippet += `>\${0}</${tag}>`;
+                  fakesnippet += `>|</${tag}>`;
+              }
+              mapSnippet.push({snip:snippet,fsnip:fakesnippet, isJsx:true});
+            // }
+            
+            console.log("Token", finalToken);
+            // console.log("Post token", postToken);
+            
+            for (let snipp of mapSnippet) {
+              const item = makeCompletion(
+                { label: finalToken, snippet: snipp.snip, fakesnippet: snipp.fsnip },
+                replaceRange,
+                snipp.isJsx
+              );
+              completions.push(item);
             }
-            
-            
-            // const label = selfClosing ? `<${tag} />` : `<${tag}>…</${tag}>`;
-            const label = finalToken;
-            const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
-
-            item.insertText = new vscode.SnippetString(snippet);
-            item.detail = `JSX <${tag}> autocompletion`;
-            item.documentation = `${isJsx ? "JSX " : "Helper "} ${fakesnippet}.`;
-            item.range = replaceRange;
-            
-            item.filterText = rawToken;  // ← Critique pour forcer l'affichage
-            item.sortText = "000";       // ← Remonte dans la liste
-                        
-            
-            completions.push(item);
             
             // console.log("Parsed token:", rawToken, parsed);
             // console.log("Returning snippet:", snippet);
